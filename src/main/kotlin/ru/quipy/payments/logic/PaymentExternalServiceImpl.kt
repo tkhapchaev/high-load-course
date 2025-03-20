@@ -15,7 +15,6 @@ import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import kotlin.math.floor
-import kotlin.math.ceil
 
 
 // Advice: always treat time as a Duration
@@ -47,17 +46,17 @@ class PaymentExternalSystemAdapterImpl(
     private val unretriableHttpCodes = mutableListOf(400, 401, 403, 404, 405)
     private val failedTransactionRetryCount = 3
 
-    private val requestDurationsMillis = TreeSet<Duration>()
-    private val requestDurationsArchiveSize = 200
-    private val requestTimeoutQuantile = 0.98
-    private val maxRequestTimeout = Duration.ofMillis(5300)
+    private val requestTimeout = Duration.ofSeconds(4)
+
+    private val client = OkHttpClient.Builder().build()
 
     init {
         logger.info("Initializing PaymentExternalSystemAdapter($accountName) with SlidingWindowRateLimiter($rps, $rateLimiterWindowSize) and Semaphore($parallelRequests, $semaphoreWaitTime)")
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        performTransaction(paymentId, amount, paymentStartedAt)
+        val transactionResult = performTransaction(paymentId, amount, paymentStartedAt)
+        retryTransaction(paymentId, amount, paymentStartedAt, deadline, transactionResult)
     }
 
     override fun price() = properties.price
@@ -103,20 +102,13 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        val requestTimeout = calculateRequestTimeout()
-
         val request = Request.Builder().run {
             url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${formatDurationAsIso(requestTimeout)}")
             post(emptyBody)
         }.build()
 
-        logger.info(request.url.toString())
-
         try {
             rateLimiter.tickBlocking()
-
-            val client = OkHttpClient.Builder().connectTimeout(requestTimeout).readTimeout(requestTimeout).writeTimeout(requestTimeout).build()
-            val startTimeMillis = now()
 
             client.newCall(request).execute().use { response ->
                 val body = try {
@@ -124,16 +116,6 @@ class PaymentExternalSystemAdapterImpl(
                 } catch (e: Exception) {
                     logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
                     ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                }
-
-                val endTimeMillis = now()
-                val elapsedTimeMillis = endTimeMillis - startTimeMillis
-
-                if (requestDurationsMillis.size < requestDurationsArchiveSize) {
-                    requestDurationsMillis.add(Duration.ofMillis(elapsedTimeMillis))
-                } else {
-                    requestDurationsMillis.remove(requestDurationsMillis.first())
-                    requestDurationsMillis.add(Duration.ofMillis(elapsedTimeMillis))
                 }
 
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
@@ -178,25 +160,6 @@ class PaymentExternalSystemAdapterImpl(
         } else {
             return rps
         }
-    }
-
-    private fun calculateRequestTimeout() : Duration {
-        if (requestDurationsMillis.isEmpty()) {
-            return requestAverageProcessingTime
-        }
-
-        val quantileIndex = ceil(requestTimeoutQuantile * requestDurationsMillis.size).toInt() - 1
-        val timeout = requestDurationsMillis.elementAt(quantileIndex)
-
-        if (timeout < requestAverageProcessingTime) {
-            return requestAverageProcessingTime
-        }
-
-        if (timeout > maxRequestTimeout) {
-            return maxRequestTimeout
-        }
-
-        return timeout
     }
 
     private fun formatDurationAsIso(duration: Duration): String {
