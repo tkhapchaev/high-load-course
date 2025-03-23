@@ -36,14 +36,15 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val rps = calculateLimiterRatePerSecond()
-    private val rateLimiterWindowSize = Duration.ofSeconds(1)
-    private val rateLimiter = SlidingWindowRateLimiter(rps, rateLimiterWindowSize)
+    private val actualRateLimitPerSec = calculateActualRateLimitPerSec()
+    private val rateLimiterWindowDuration = Duration.ofSeconds(1)
+    private val rateLimiter = SlidingWindowRateLimiter(actualRateLimitPerSec, rateLimiterWindowDuration)
 
+    private val semaphorePermits = parallelRequests
     private val semaphoreWaitTime = requestAverageProcessingTime
-    private val semaphore = Semaphore(parallelRequests)
+    private val semaphore = Semaphore(semaphorePermits)
 
-    private val unretriableHttpCodes = mutableListOf(400, 401, 403, 404, 405)
+    private val unretriableHttpCodes = listOf(400, 401, 403, 404, 405)
     private val failedTransactionRetryCount = 3
 
     private val requestTimeout = Duration.ofSeconds(4)
@@ -51,7 +52,7 @@ class PaymentExternalSystemAdapterImpl(
     private val client = OkHttpClient.Builder().build()
 
     init {
-        logger.info("Initializing PaymentExternalSystemAdapter($accountName) with SlidingWindowRateLimiter($rps, $rateLimiterWindowSize) and Semaphore($parallelRequests, $semaphoreWaitTime)")
+        logger.info("Initializing PaymentExternalSystemAdapter($accountName) with SlidingWindowRateLimiter($actualRateLimitPerSec, $rateLimiterWindowDuration) and Semaphore($semaphorePermits, $semaphoreWaitTime)")
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -151,7 +152,7 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    private fun calculateLimiterRatePerSecond() : Long {
+    private fun calculateActualRateLimitPerSec() : Long {
         val rps = floor((1000.0 / requestAverageProcessingTime.toMillis()) * parallelRequests).toLong()
 
         if (rps >= rateLimitPerSec) {
