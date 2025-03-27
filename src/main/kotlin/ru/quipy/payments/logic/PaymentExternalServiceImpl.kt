@@ -44,20 +44,21 @@ class PaymentExternalSystemAdapterImpl(
     private val semaphoreWaitTime = requestAverageProcessingTime
     private val semaphore = Semaphore(semaphorePermits)
 
-    private val unretriableHttpCodes = listOf(400, 401, 403, 404, 405)
+    private val unretriableHttpCodes = listOf(400, 401, 403, 404, 405, 408)
     private val failedTransactionRetryCount = 3
 
-    private val requestTimeout = Duration.ofSeconds(4)
+    private val requestTimeout = Duration.ofMillis((requestAverageProcessingTime.toMillis() * 1.25).toLong())
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder().callTimeout(requestTimeout).build()
 
     init {
-        logger.info("Initializing PaymentExternalSystemAdapter($accountName) with SlidingWindowRateLimiter($actualRateLimitPerSec, $rateLimiterWindowDuration) and Semaphore($semaphorePermits, $semaphoreWaitTime)")
+        logger.info("Initializing PaymentExternalSystemAdapter($accountName) with SlidingWindowRateLimiter($actualRateLimitPerSec, $rateLimiterWindowDuration), Semaphore($semaphorePermits, $semaphoreWaitTime) and RequestTimeout($requestTimeout)")
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        val transactionResult = performTransaction(paymentId, amount, paymentStartedAt)
-        retryTransaction(paymentId, amount, paymentStartedAt, deadline, transactionResult)
+        performTransaction(paymentId, amount, paymentStartedAt)
+        // val transactionResult = performTransaction(paymentId, amount, paymentStartedAt)
+        // retryTransaction(paymentId, amount, paymentStartedAt, deadline, transactionResult)
     }
 
     override fun price() = properties.price
