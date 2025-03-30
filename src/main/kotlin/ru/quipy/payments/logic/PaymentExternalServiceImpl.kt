@@ -12,8 +12,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.Semaphore
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.*
 import kotlin.math.floor
 
 
@@ -44,20 +43,42 @@ class PaymentExternalSystemAdapterImpl(
     private val semaphoreWaitTime = requestAverageProcessingTime
     private val semaphore = Semaphore(semaphorePermits)
 
-    private val unretriableHttpCodes = listOf(400, 401, 403, 404, 405)
+    private val unretriableHttpCodes = listOf(400, 401, 403, 404, 405, 408)
     private val failedTransactionRetryCount = 3
 
-    private val requestTimeout = Duration.ofSeconds(4)
+    private val requestTimeout = Duration.ofSeconds(10)
 
-    private val client = OkHttpClient.Builder().build()
+    private val threadsCount = calculateThreadsCount()
+    private val threadPool = ThreadPoolExecutor(
+        threadsCount,
+        threadsCount,
+        1,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue(),
+        Executors.defaultThreadFactory(),
+        ThreadPoolExecutor.AbortPolicy()
+    )
+
+    private val client = OkHttpClient.Builder().callTimeout(requestTimeout).build()
 
     init {
-        logger.info("Initializing PaymentExternalSystemAdapter($accountName) with SlidingWindowRateLimiter($actualRateLimitPerSec, $rateLimiterWindowDuration) and Semaphore($semaphorePermits, $semaphoreWaitTime)")
+        val indent = "\t".repeat(26)
+        val serviceInfo = "Initializing PaymentExternalSystemAdapter for $accountName with:\n" +
+                          "${indent}SlidingWindowRateLimiter($actualRateLimitPerSec, $rateLimiterWindowDuration)\n" +
+                          "${indent}Semaphore($semaphorePermits, $semaphoreWaitTime)\n" +
+                          "${indent}RequestTimeout($requestTimeout)\n" +
+                          "${indent}ThreadsCount($threadsCount)\n"
+
+        logger.info(serviceInfo)
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        val transactionResult = performTransaction(paymentId, amount, paymentStartedAt)
-        retryTransaction(paymentId, amount, paymentStartedAt, deadline, transactionResult)
+        threadPool.submit {
+            val transactionResult = performTransaction(paymentId, amount, paymentStartedAt)
+            if (isTransactionRetriable(transactionResult)) {
+                retryTransaction(paymentId, amount, paymentStartedAt, deadline, transactionResult)
+            }
+        }
     }
 
     override fun price() = properties.price
@@ -70,10 +91,11 @@ class PaymentExternalSystemAdapterImpl(
         var transactionResult = failedTransactionResult
         var retryCounter = 0
 
-        while (transactionResult.httpCode != null && !transactionResult.isSuccess && transactionResult.httpCode !in unretriableHttpCodes && retryCounter < failedTransactionRetryCount) {
+        while (isTransactionRetriable(transactionResult) && retryCounter < failedTransactionRetryCount) {
             if (now() + requestAverageProcessingTime.toMillis() < deadline) {
                 logger.info("[${accountName}] Transaction for payment $paymentId failed. Retrying... (${retryCounter + 1}/$failedTransactionRetryCount)")
                 transactionResult = performTransaction(paymentId, amount, paymentStartedAt)
+                performTransaction(paymentId, amount, paymentStartedAt)
             } else {
                 break
             }
@@ -161,6 +183,14 @@ class PaymentExternalSystemAdapterImpl(
         } else {
             return rps
         }
+    }
+
+    private fun calculateThreadsCount() : Int {
+        return (actualRateLimitPerSec / (1000 / requestAverageProcessingTime.toMillis())).toInt()
+    }
+
+    private fun isTransactionRetriable(transactionResult: TransactionResult) : Boolean {
+        return !transactionResult.isSuccess && transactionResult.httpCode != null && transactionResult.httpCode !in unretriableHttpCodes
     }
 
     private fun formatDurationAsIso(duration: Duration): String {
