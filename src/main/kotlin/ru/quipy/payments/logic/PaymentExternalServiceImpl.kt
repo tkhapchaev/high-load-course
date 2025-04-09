@@ -2,17 +2,18 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
+import kotlinx.coroutines.*
+import okhttp3.*
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.*
+import kotlin.coroutines.resumeWithException
 import kotlin.math.floor
 
 
@@ -46,20 +47,20 @@ class PaymentExternalSystemAdapterImpl(
     private val unretriableHttpCodes = listOf(400, 401, 403, 404, 405, 408)
     private val failedTransactionRetryCount = 3
 
-    private val requestTimeout = Duration.ofSeconds(10)
-
+    private val requestTimeout = Duration.ofMillis(requestAverageProcessingTime.toMillis() * 3)
     private val threadsCount = calculateThreadsCount()
-    private val threadPool = ThreadPoolExecutor(
-        threadsCount,
-        threadsCount,
-        1,
-        TimeUnit.SECONDS,
-        LinkedBlockingQueue(),
-        Executors.defaultThreadFactory(),
-        ThreadPoolExecutor.AbortPolicy()
-    )
 
-    private val client = OkHttpClient.Builder().callTimeout(requestTimeout).build()
+    private val connectionPoolMaxIdleConnections = 500
+    private val connectionPoolKeepAlive = Duration.ofMinutes(10)
+    private val dispatcherMaxRequests = 1000
+    private val dispatcherMaxRequestsPerHost = 1000
+
+    private val client = OkHttpClient.Builder()
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .connectionPool(ConnectionPool(connectionPoolMaxIdleConnections, connectionPoolKeepAlive.toMinutes(), TimeUnit.MINUTES))
+        .dispatcher(Dispatcher().apply { maxRequests = dispatcherMaxRequests; maxRequestsPerHost = dispatcherMaxRequestsPerHost })
+        .callTimeout(requestTimeout.toSeconds(), TimeUnit.SECONDS)
+        .build()
 
     init {
         val indent = "\t".repeat(26)
@@ -73,7 +74,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        threadPool.submit {
+        CoroutineScope(Dispatchers.IO).launch {
             val transactionResult = performTransaction(paymentId, amount, paymentStartedAt)
             if (isTransactionRetriable(transactionResult)) {
                 retryTransaction(paymentId, amount, paymentStartedAt, deadline, transactionResult)
@@ -87,7 +88,7 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun name() = properties.accountName
 
-    private fun retryTransaction(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, failedTransactionResult: TransactionResult) {
+    private suspend fun retryTransaction(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long, failedTransactionResult: TransactionResult) {
         var transactionResult = failedTransactionResult
         var retryCounter = 0
 
@@ -95,7 +96,6 @@ class PaymentExternalSystemAdapterImpl(
             if (now() + requestAverageProcessingTime.toMillis() < deadline) {
                 logger.info("[${accountName}] Transaction for payment $paymentId failed. Retrying... (${retryCounter + 1}/$failedTransactionRetryCount)")
                 transactionResult = performTransaction(paymentId, amount, paymentStartedAt)
-                performTransaction(paymentId, amount, paymentStartedAt)
             } else {
                 break
             }
@@ -104,7 +104,8 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    private fun performTransaction(paymentId: UUID, amount: Int, paymentStartedAt: Long) : TransactionResult {
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private suspend fun performTransaction(paymentId: UUID, amount: Int, paymentStartedAt: Long) : TransactionResult {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
         val transactionId = UUID.randomUUID()
 
@@ -133,23 +134,41 @@ class PaymentExternalSystemAdapterImpl(
         try {
             rateLimiter.tickBlocking()
 
-            client.newCall(request).execute().use { response ->
-                val body = try {
-                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                }
+            return suspendCancellableCoroutine { continuation ->
+                client.newCall(request).enqueue(object : Callback {
+                    override fun onResponse(call: Call, response: Response) {
+                        val body = try {
+                            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        } catch (e: Exception) {
+                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}, protocol: ${response.protocol}")
+                            ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                        }
 
-                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}, protocol: ${response.protocol}")
 
-                // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                paymentESService.update(paymentId) {
-                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                }
+                        // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                        // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        }
 
-                return TransactionResult(response.code, body.result)
+                        continuation.resume(TransactionResult(response.code, body.result)) { exception ->
+                            continuation.resumeWithException(exception)
+                        }
+                    }
+
+                    override fun onFailure(call: Call, e: IOException) {
+                        logger.warn("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId, succeeded: false, message: ${e.message}")
+
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = e.message)
+                        }
+
+                        continuation.resume(TransactionResult(null, false)) { exception ->
+                            continuation.resumeWithException(exception)
+                        }
+                    }
+                })
             }
         } catch (e: Exception) {
             when (e) {
@@ -178,7 +197,7 @@ class PaymentExternalSystemAdapterImpl(
         val rps = floor((1000.0 / requestAverageProcessingTime.toMillis()) * parallelRequests).toLong()
 
         if (rps >= rateLimitPerSec) {
-            logger.warn("Calculated rps value for rate limiter exceeds its limit set in [$accountName]")
+            logger.warn("Calculated rps value for rate limiter exceeds its limit set in $accountName")
             return rateLimitPerSec.toLong()
         } else {
             return rps
@@ -186,7 +205,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun calculateThreadsCount() : Int {
-        return (actualRateLimitPerSec / (1000 / requestAverageProcessingTime.toMillis())).toInt()
+        return (actualRateLimitPerSec / (1000.0 / requestAverageProcessingTime.toMillis())).toInt()
     }
 
     private fun isTransactionRetriable(transactionResult: TransactionResult) : Boolean {
