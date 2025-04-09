@@ -178,7 +178,7 @@ class PaymentExternalSystemAdapterImpl(
         val rps = floor((1000.0 / requestAverageProcessingTime.toMillis()) * parallelRequests).toLong()
 
         if (rps >= rateLimitPerSec) {
-            logger.warn("Calculated rps value for rate limiter exceeds its limit set in [$accountName]")
+            logger.warn("Calculated rps value for rate limiter exceeds its limit set in $accountName")
             return rateLimitPerSec.toLong()
         } else {
             return rps
@@ -186,7 +186,7 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun calculateThreadsCount() : Int {
-        return (actualRateLimitPerSec / (1000 / requestAverageProcessingTime.toMillis())).toInt()
+        return (actualRateLimitPerSec / (1000.0 / requestAverageProcessingTime.toMillis())).toInt()
     }
 
     private fun isTransactionRetriable(transactionResult: TransactionResult) : Boolean {
